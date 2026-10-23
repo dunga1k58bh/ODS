@@ -1,0 +1,37 @@
+name: Native Windows regressions
+
+on:
+  pull_request:
+    paths:
+      - 'ods/native/windows/**'
+      - 'ods/bin/**'
+      - 'ods/tests/test-native-windows-runtime-probe.py'
+      - '.github/workflows/test-native-windows.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ods/native/windows/**'
+      - 'ods/bin/**'
+      - 'ods/tests/test-native-windows-runtime-probe.py'
+      - '.github/workflows/test-native-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native-regressions:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: '3.13'
+      - name: Configure
+        run: cmake -S ods/native/windows -B ods/native/windows/build/ci -A x64 -DODS_NATIVE_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build ods/native/windows/build/ci --config Release
+      - name: Run native regressions
+        run: ctest --test-dir ods/native/windows/build/ci -C Release --output-on-failure
+      - name: Run Python bridge regressions
+        run: python -B ods/tests/test-native-windows-runtime-probe.py
