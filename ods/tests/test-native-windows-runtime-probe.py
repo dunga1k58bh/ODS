@@ -4,11 +4,17 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
+import socket
 import sys
 import tempfile
+import time
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from unittest.mock import Mock, patch
 
 
@@ -64,6 +70,99 @@ class NativeProbeTests(unittest.TestCase):
             code, result = self.invoke()
         self.assertEqual(code, 1)
         self.assertFalse(result["ok"])
+
+
+class NativeAgentStartupTests(unittest.TestCase):
+    def test_context_http_success_validation_and_rollback(self):
+        agent = bridge.load_host_agent()
+        agent.AGENT_API_KEY = "test-context-key"
+        server = agent.ThreadedHTTPServer(("127.0.0.1", 0), agent.NativeWindowsAgentHandler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        origin = f"http://127.0.0.1:{server.server_port}/v1/native/context"
+
+        def request(body, authenticated=True):
+            headers = {"Authorization": "Bearer test-context-key"} if authenticated else {}
+            req = urllib.request.Request(origin, data=json.dumps(body).encode(), headers=headers)
+            try:
+                response = urllib.request.urlopen(req, timeout=3)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                return response.code, json.load(response)
+
+        try:
+            with patch.object(agent, "load_env", return_value={"ODS_NATIVE_HOST_EXE": "configured"}), \
+                    patch.object(agent, "_restart_experimental_windows_native") as restart:
+                self.assertEqual(request({"context_length": 8192}, False)[0], 401)
+                restart.assert_not_called()
+                for body in ({"context_length": True}, {"context_length": 0}, {"model": "other"}):
+                    self.assertEqual(request(body)[0], 400)
+                restart.assert_not_called()
+                code, body = request({"context_length": 8192})
+                self.assertEqual(code, 200)
+                self.assertEqual(body, {"status": "ready", "context_length": 8192, "persisted": False})
+                self.assertEqual(restart.call_args.args[1]["CTX_SIZE"], "8192")
+                restored = Mock()
+                restored._llama_launch_settings = {"context_length": 4096}
+                restart.side_effect = agent.NativeLlamaRestartError("restored", restored)
+                code, body = request({"context_length": 8192})
+                self.assertEqual(code, 409)
+                self.assertTrue(body["restored"])
+                self.assertEqual(body["context_length"], 4096)
+                restart.side_effect = OSError("private diagnostic")
+                code, body = request({"context_length": 8192})
+                self.assertEqual(code, 503)
+                self.assertNotIn("private diagnostic", json.dumps(body))
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=3)
+
+    @unittest.skipUnless(sys.platform == "win32", "Native Windows startup integration")
+    def test_starts_without_docker_and_blocks_unported_routes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / ".env").write_text("ODS_AGENT_KEY=test-native-key\n", encoding="utf-8")
+            with socket.socket() as reservation:
+                reservation.bind(("127.0.0.1", 0))
+                port = reservation.getsockname()[1]
+            environment = dict(os.environ, PATH="")
+            process = subprocess.Popen(
+                [sys.executable, "-B", str(SOURCE / "bin/ods-host-agent.py"),
+                 "--native-windows", "--install-dir", directory, "--port", str(port)],
+                env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            try:
+                origin = f"http://127.0.0.1:{port}"
+                for _ in range(50):
+                    try:
+                        with urllib.request.urlopen(origin + "/health", timeout=1) as response:
+                            health = json.load(response)
+                        break
+                    except OSError:
+                        if process.poll() is not None:
+                            self.fail(process.communicate()[1].decode(errors="replace"))
+                        time.sleep(0.1)
+                else:
+                    self.fail("Native server did not start")
+                self.assertEqual(health["mode"], "native-windows")
+                self.assertEqual(health["capabilities"], ["native-context"])
+                for headers, expected in (({}, 401), ({"Authorization": "Bearer test-native-key"}, 501)):
+                    request = urllib.request.Request(origin + "/v1/model/activate", data=b"{}", headers=headers)
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(request, timeout=2)
+                    self.assertEqual(error.exception.code, expected)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate(timeout=5)
+            legacy = subprocess.run(
+                [sys.executable, "-B", str(SOURCE / "bin/ods-host-agent.py"),
+                 "--install-dir", directory, "--port", str(port)],
+                env=environment, capture_output=True, timeout=5,
+            )
+            self.assertNotEqual(legacy.returncode, 0)
+            self.assertIn(b"docker not found in PATH", legacy.stderr)
 
 
 class NativeLaunchArgumentsTests(unittest.TestCase):

@@ -17549,6 +17549,7 @@ _WINDOWS_NATIVE_LLAMA_KEY_RE = re.compile(r"[0-9a-f]{64}")
 _WINDOWS_NATIVE_RESTART_TIMEOUT_SECONDS = 1200
 _WINDOWS_NATIVE_SESSIONS = {}
 _WINDOWS_NATIVE_SESSION_LOCK = threading.RLock()
+_NATIVE_AGENT_STOPPING = threading.Event()
 
 
 def _start_windows_native_runtime(host: Path, executable: Path,
@@ -22102,6 +22103,99 @@ def _start_wsl_port_check() -> threading.Thread | None:
     return thread
 
 
+def _set_native_windows_context(context_length):
+    """Apply a session-only context override; do not rewrite installed config."""
+    if type(context_length) is not int or not _MIN_MODEL_CONTEXT <= context_length <= _MAX_MODEL_CONTEXT:
+        raise ValueError("context_length is outside the supported model context range")
+    env_path = INSTALL_DIR / ".env"
+    with _WINDOWS_NATIVE_SESSION_LOCK:
+        if _NATIVE_AGENT_STOPPING.is_set():
+            raise RuntimeError("Native host agent is shutting down")
+        env = load_env(env_path)
+        if not env.get("ODS_NATIVE_HOST_EXE"):
+            raise ValueError("ODS_NATIVE_HOST_EXE must be configured for native context changes")
+        previous = _WINDOWS_NATIVE_SESSIONS.get(INSTALL_DIR.resolve())
+        if previous is not None and previous._llama_launch_settings["model"].name != env.get("GGUF_FILE"):
+            raise ValueError("The configured model changed; this endpoint only changes context")
+        _restart_experimental_windows_native(env_path, env | {"CTX_SIZE": str(context_length)})
+    return {"status": "ready", "context_length": context_length, "persisted": False}
+
+
+class NativeWindowsAgentHandler(AgentHandler):
+    """Restricted native endpoints; full model activation still requires porting."""
+
+    def _unsupported(self):
+        self.close_connection = True
+        if check_auth(self):
+            json_response(self, 501, {"error": "Endpoint not available in native Windows mode yet"})
+
+    def do_GET(self):
+        if self.path == "/health":
+            json_response(self, 200, {"status": "ok", "version": VERSION,
+                                      "mode": "native-windows", "capabilities": ["native-context"]})
+        else:
+            self._unsupported()
+
+    def do_POST(self):
+        if self.path != "/v1/native/context":
+            self._unsupported()
+            return
+        self.close_connection = True
+        if not check_auth(self):
+            return
+        body = read_json_body(self)
+        if body is None:
+            return
+        if set(body) != {"context_length"}:
+            json_response(self, 400, {"error": "Expected only context_length"})
+            return
+        try:
+            result = _set_native_windows_context(body["context_length"])
+        except ValueError as error:
+            json_response(self, 400, {"error": str(error)})
+        except NativeLlamaRestartError as error:
+            restored = error.restored_runtime
+            json_response(self, 409, {
+                "error": "Context change failed", "restored": restored is not None,
+                "context_length": restored._llama_launch_settings["context_length"] if restored else None,
+                "persisted": False,
+            })
+        except (OSError, RuntimeError):
+            json_response(self, 503, {"error": "Native context change failed; inspect runtime logs"})
+        else:
+            json_response(self, 200, result)
+
+
+def _serve_native_windows_agent(install_dir: Path, port: int):
+    """Start only the Windows loopback control plane, with no Docker tasks."""
+    global INSTALL_DIR, AGENT_API_KEY
+    if platform.system() != "Windows":
+        raise ValueError("--native-windows requires Windows")
+    if not install_dir.is_dir() or not 1 <= port <= 65535:
+        raise ValueError("Native mode requires an existing install directory and port in 1..65535")
+    env = load_env(install_dir / ".env")
+    key = env.get("ODS_AGENT_KEY") or env.get("DASHBOARD_API_KEY")
+    if not key:
+        raise ValueError("Native mode requires ODS_AGENT_KEY or DASHBOARD_API_KEY in .env")
+    if env.get("ODS_AGENT_BIND", "127.0.0.1") != "127.0.0.1":
+        raise ValueError("Native mode currently requires ODS_AGENT_BIND=127.0.0.1")
+    INSTALL_DIR, AGENT_API_KEY = install_dir, key
+    _NATIVE_AGENT_STOPPING.clear()
+    server = ThreadedHTTPServer(("127.0.0.1", port), NativeWindowsAgentHandler)
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(signum, lambda value, _frame: _request_server_shutdown(server, value))
+        logger.info("Native Windows host agent listening on 127.0.0.1:%d", port)
+        server.serve_forever()
+    finally:
+        server.server_close()
+        _NATIVE_AGENT_STOPPING.set()
+        with _WINDOWS_NATIVE_SESSION_LOCK:
+            session = _WINDOWS_NATIVE_SESSIONS.pop(install_dir.resolve(), None)
+            if session is not None:
+                session.stop()
+
+
 def main():
     global INSTALL_DIR, DATA_DIR, AGENT_API_KEY, GPU_BACKEND, STARTUP_ODS_MODE
     global TIER, GPU_COUNT, CORE_SERVICE_IDS
@@ -22111,6 +22205,8 @@ def main():
     parser.add_argument("--port", type=int, default=7710, help="Listen port (default: 7710)")
     parser.add_argument("--pid-file", type=str, default="", help="Write PID to this file")
     parser.add_argument("--install-dir", type=str, default="", help="ODS install directory")
+    parser.add_argument("--native-windows", action="store_true",
+                        help="Experimental Windows loopback control plane without Docker")
     parser.add_argument(
         "--require-ods-network", action="store_true",
         help="Fail closed until the ODS Docker network exists (systemd will retry)",
@@ -22121,6 +22217,17 @@ def main():
         level=logging.INFO, stream=sys.stderr,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    if args.native_windows:
+        if args.require_ods_network or args.pid_file:
+            parser.error("--native-windows does not support --require-ods-network or --pid-file yet")
+        install = Path(args.install_dir or os.environ.get("ODS_HOME") or Path(__file__).resolve().parent.parent).resolve()
+        try:
+            _serve_native_windows_agent(install, args.port)
+        except (ValueError, OSError) as error:
+            logger.error("Native Windows startup failed: %s", error)
+            sys.exit(1)
+        return
 
     if not shutil.which("docker"):
         logger.error("docker not found in PATH")

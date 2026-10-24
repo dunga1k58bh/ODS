@@ -32,6 +32,10 @@ Run ODS core functionality directly on Windows without Docker or WSL. Use C++ fo
 
 ## 3. Integrate ODS core
 
+- Existing UI path: `useModels.js` posts `/api/models/{id}/load`; dashboard-api forwards to host-agent `/v1/model/activate`. Reuse this path.
+- Before UI acceptance, separate host-agent startup and activation from Docker: `main()` currently requires the Docker CLI, and activation still recreates dependent services through Compose after the inference restart.
+- Next implementation slice: identify startup tasks required by the native model control plane and introduce an explicit native mode without weakening the existing Docker mode's checks. Do not simply remove the Docker prerequisite.
+- Startup checkpoint: `ods-host-agent.py --native-windows --install-dir <dir> --port <port>` starts on Windows without Docker, using the install's agent key and loopback only. `/health` reports capabilities. Authenticated `POST /v1/native/context` accepts only `context_length`, starts/restarts the configured model and reports rollback; this is a session-only override, not a `.env` update. Other GET/POST routes require authentication and return 501 until ported. Full model activation and background reconciliation remain unavailable.
 - Add a native Windows adapter to the existing Model Switchboard.
 - Retain model selection, activation transactions, routing, and rollback in the existing control layer.
 - Run the required backend services natively and connect the dashboard.

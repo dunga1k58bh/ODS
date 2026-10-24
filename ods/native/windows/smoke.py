@@ -13,6 +13,9 @@ from pathlib import Path
 import secrets
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 
@@ -22,6 +25,7 @@ def main():
     parser.add_argument("--llama", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--http", action="store_true", help="Exercise the native context HTTP endpoint")
     args = parser.parse_args()
     if sys.platform != "win32" or os.environ.get("ODS_HOST_INSTALL_DIR"):
         parser.error("Run from native Windows Python without ODS_HOST_INSTALL_DIR")
@@ -58,11 +62,45 @@ def main():
             CTX_SIZE="4096", N_GPU_LAYERS="99", LLAMA_REASONING="off",
         )
         agent.INSTALL_DIR = install
+        server = None
+        worker = None
+        if args.http:
+            agent.AGENT_API_KEY = secrets.token_hex(32)
+            env_path.write_text("\n".join(f"{name}={json.dumps(value)}" for name, value in env.items()), encoding="utf-8")
+            server = agent.ThreadedHTTPServer(("127.0.0.1", 0), agent.NativeWindowsAgentHandler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+
+        def activate(context):
+            if server is None:
+                agent._restart_windows_native_llama_server(env_path, env | {"CTX_SIZE": context})
+                return
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_port}/v1/native/context",
+                data=json.dumps({"context_length": int(context)}).encode(),
+                headers={"Authorization": "Bearer " + agent.AGENT_API_KEY,
+                         "Content-Type": "application/json"},
+            )
+            try:
+                response = urllib.request.urlopen(request, timeout=180)
+            except urllib.error.HTTPError as error:
+                with error:
+                    result = json.load(error)
+                if error.code == 409 and result.get("restored") and result.get("context_length") == 8192:
+                    restored = agent._WINDOWS_NATIVE_SESSIONS[install.resolve()]
+                    raise agent.NativeLlamaRestartError("HTTP 409: previous context restored", restored) from error
+                raise RuntimeError(f"Context API failed: HTTP {error.code}") from error
+            with response:
+                result = json.load(response)
+            if result != {"status": "ready", "context_length": int(context), "persisted": False}:
+                raise RuntimeError("Context API returned an unexpected result")
+            print(f"PASS: HTTP 200, context {context}, persisted=false", flush=True)
+
         try:
-            agent._restart_windows_native_llama_server(env_path, env)
+            activate("4096")
             print("PASS: real model/context/completion at context 4096", flush=True)
             env["CTX_SIZE"] = "8192"
-            agent._restart_windows_native_llama_server(env_path, env)
+            activate("8192")
             print("PASS: restart to context 8192", flush=True)
             real_proof = agent._wait_for_model_readiness
 
@@ -73,7 +111,7 @@ def main():
 
             with patch.object(agent, "_wait_for_model_readiness", side_effect=inject_failure):
                 try:
-                    agent._restart_windows_native_llama_server(env_path, env | {"CTX_SIZE": "16384"})
+                    activate("16384")
                 except agent.NativeLlamaRestartError as error:
                     restored = error.restored_runtime
                     if restored is None or restored.poll() is not None:
@@ -89,6 +127,10 @@ def main():
                 print("\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]).replace(key, "[redacted]"), file=sys.stderr)
             raise
         finally:
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=5)
             session = agent._WINDOWS_NATIVE_SESSIONS.pop(install.resolve(), None)
             if session is not None:
                 session.stop()

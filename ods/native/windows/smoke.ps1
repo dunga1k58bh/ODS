@@ -5,7 +5,8 @@ param(
     [string]$Model = 'D:\data\Qwen3.5-9B-Q4_K_M.gguf',
     [string]$Python,
     [string]$HostExecutable,
-    [ValidateRange(1, 65535)][int]$Port = 18080
+    [ValidateRange(1, 65535)][int]$Port = 18080,
+    [switch]$Http
 )
 $ErrorActionPreference = 'Stop'
 if (-not $Python) { $Python = Join-Path $PSScriptRoot 'build\python-3.13.17\python.exe' }
@@ -13,5 +14,7 @@ if (-not $HostExecutable) { $HostExecutable = Join-Path $PSScriptRoot 'build\deb
 foreach ($path in @($Llama, $Model, $Python, $HostExecutable)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required file not found: $path" }
 }
-& $Python -B (Join-Path $PSScriptRoot 'smoke.py') --host $HostExecutable --llama $Llama --model $Model --port $Port
+$extraArguments = @()
+if ($Http) { $extraArguments += '--http' }
+& $Python -B (Join-Path $PSScriptRoot 'smoke.py') --host $HostExecutable --llama $Llama --model $Model --port $Port @extraArguments
 if ($LASTEXITCODE -ne 0) { throw "Native lifecycle smoke failed (exit $LASTEXITCODE)" }
