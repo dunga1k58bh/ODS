@@ -17564,6 +17564,58 @@ def _start_windows_native_runtime(host: Path, executable: Path,
     return runtime
 
 
+def _start_windows_native_llama(*, host: Path, executable: Path, model: Path,
+                                api_key_file: Path, api_key: str, log: Path,
+                                port: int, context_length: int, gpu_layers: int,
+                                backend: str):
+    """Explicit basic CPU/CUDA launch, separate from installed restart policy.
+
+    The caller supplies the selected runtime and an already provisioned private
+    key file, then owns stopping the returned, proof-verified session.
+    This checks file presence, not runtime provenance or hardware qualification.
+    """
+    if platform.system() != "Windows":
+        raise RuntimeError("The native Windows process host requires Windows")
+    from native_windows_runtime import build_llama_arguments
+    for path in (host, executable):
+        if not path.is_absolute() or not path.is_file() or path.suffix.lower() != ".exe":
+            raise ValueError("Native runtime executables require existing absolute .exe paths")
+    arguments = build_llama_arguments(
+        model=model, api_key_file=api_key_file, port=port,
+        context_length=context_length, gpu_layers=gpu_layers, backend=backend,
+    )
+    if not _WINDOWS_NATIVE_LLAMA_KEY_RE.fullmatch(api_key):
+        raise ValueError("The native runtime API key must be 64 lowercase hex characters")
+    if api_key_file.read_bytes() != api_key.encode("ascii"):
+        raise ValueError("The native runtime key file does not match the configured key")
+    if log.resolve() in {path.resolve() for path in (host, executable, model, api_key_file)}:
+        raise ValueError("The runtime log must not overwrite a runtime, model or key file")
+    runtime = _start_windows_native_runtime(host, executable, arguments, log)
+    ready = False
+    try:
+        # These settings select the existing authenticated Windows loopback
+        # proof transport; GPU/backend launch policy was already applied above.
+        proof_env = {
+            "GPU_BACKEND": "amd", "AMD_INFERENCE_LOCATION": "host",
+            "AMD_INFERENCE_RUNTIME": "llama-server", "AMD_INFERENCE_PORT": str(port),
+            "LLAMA_SERVER_API_KEY": api_key, "CTX_SIZE": str(context_length),
+        }
+        proof = _wait_for_model_readiness(
+            proof_env, model_id=model.name, gguf_file=model.name,
+            llm_model_name=model.name, attempts=120, initial_delay=0, interval=1,
+            return_proof=True, require_exact_context=True,
+            env_still_current=lambda: runtime.poll() is None,
+        )
+        if not proof or runtime.poll() is not None:
+            raise RuntimeError("Native llama-server exited or failed model/context readiness")
+        ready = True
+        return runtime
+    finally:
+        # Also clean up on exceptions and keyboard interruption during proof.
+        if not ready:
+            runtime.stop()
+
+
 def _restart_windows_native_llama_server(env_path: Path, env: dict):
     r"""Relaunch the installation's native Windows llama-server from its .env.
 
