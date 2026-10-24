@@ -3,6 +3,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { resolveRendererFile } = require('./renderer-files.cjs')
+const { HostAgent } = require('./host-agent.cjs')
 
 protocol.registerSchemesAsPrivileged([
   { scheme: 'ods', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
@@ -10,6 +11,8 @@ protocol.registerSchemesAsPrivileged([
 
 const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; worker-src 'self' blob:; connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'"
 let window
+let hostAgent
+let shutdownComplete = false
 
 function createWindow() {
   window = new BrowserWindow({
@@ -40,6 +43,13 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     const root = path.join(app.getAppPath(), 'dist', 'renderer')
     if (!fs.existsSync(path.join(root, 'index.html'))) throw new Error('Dashboard build missing. Run npm run build first.')
+    const configArgument = process.argv.find(argument => argument.startsWith('--native-config='))
+    if (configArgument) {
+      const config = JSON.parse(fs.readFileSync(configArgument.slice('--native-config='.length), 'utf8'))
+      hostAgent = new HostAgent(config, path.join(app.getPath('logs'), 'native-host-agent.log'))
+      const health = await hostAgent.waitReady()
+      console.info(`Native host agent ready (PID ${health.pid})`)
+    }
     session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
     session.defaultSession.setPermissionCheckHandler(() => false)
     // Until backend wiring exists, the shell serves only its bundled UI.
@@ -70,8 +80,17 @@ if (!app.requestSingleInstanceLock()) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow().catch(error => dialog.showErrorBox('ODS', error.message))
     })
   }).catch(error => {
+    if (hostAgent?.stopping) return
     dialog.showErrorBox('ODS startup failed', error.message)
     app.quit()
   })
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
+  app.on('before-quit', event => {
+    if (!hostAgent || shutdownComplete) return
+    event.preventDefault()
+    hostAgent.stop().catch(error => dialog.showErrorBox('ODS shutdown', error.message)).finally(() => {
+      shutdownComplete = true
+      app.quit()
+    })
+  })
 }

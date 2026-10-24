@@ -17613,7 +17613,7 @@ def _start_windows_native_llama(*, host: Path, executable: Path, model: Path,
             proof_env, model_id=model.name, gguf_file=model.name,
             llm_model_name=model.name, attempts=120, initial_delay=0, interval=1,
             return_proof=True, require_exact_context=True,
-            env_still_current=lambda: runtime.poll() is None,
+            env_still_current=lambda: runtime.poll() is None and not _NATIVE_AGENT_STOPPING.is_set(),
         )
         if not proof or runtime.poll() is not None:
             raise RuntimeError("Native llama-server exited or failed model/context readiness")
@@ -22131,7 +22131,7 @@ class NativeWindowsAgentHandler(AgentHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            json_response(self, 200, {"status": "ok", "version": VERSION,
+            json_response(self, 200, {"status": "ok", "version": VERSION, "pid": os.getpid(),
                                       "mode": "native-windows", "capabilities": ["native-context"]})
         else:
             self._unsupported()
@@ -22166,7 +22166,7 @@ class NativeWindowsAgentHandler(AgentHandler):
             json_response(self, 200, result)
 
 
-def _serve_native_windows_agent(install_dir: Path, port: int):
+def _serve_native_windows_agent(install_dir: Path, port: int, parent_pipe: bool = False):
     """Start only the Windows loopback control plane, with no Docker tasks."""
     global INSTALL_DIR, AGENT_API_KEY
     if platform.system() != "Windows":
@@ -22183,6 +22183,15 @@ def _serve_native_windows_agent(install_dir: Path, port: int):
     _NATIVE_AGENT_STOPPING.clear()
     server = ThreadedHTTPServer(("127.0.0.1", port), NativeWindowsAgentHandler)
     try:
+        if parent_pipe:
+            def watch_parent():
+                try:
+                    while sys.stdin.buffer.read(1):
+                        pass
+                finally:
+                    _NATIVE_AGENT_STOPPING.set()
+                    _request_server_shutdown(server)
+            threading.Thread(target=watch_parent, name="ods-desktop-parent", daemon=True).start()
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, lambda value, _frame: _request_server_shutdown(server, value))
         logger.info("Native Windows host agent listening on 127.0.0.1:%d", port)
@@ -22207,11 +22216,15 @@ def main():
     parser.add_argument("--install-dir", type=str, default="", help="ODS install directory")
     parser.add_argument("--native-windows", action="store_true",
                         help="Experimental Windows loopback control plane without Docker")
+    parser.add_argument("--parent-pipe", action="store_true",
+                        help="Stop native mode when the launching parent's stdin pipe closes")
     parser.add_argument(
         "--require-ods-network", action="store_true",
         help="Fail closed until the ODS Docker network exists (systemd will retry)",
     )
     args = parser.parse_args()
+    if args.parent_pipe and not args.native_windows:
+        parser.error("--parent-pipe requires --native-windows")
 
     logging.basicConfig(
         level=logging.INFO, stream=sys.stderr,
@@ -22223,7 +22236,7 @@ def main():
             parser.error("--native-windows does not support --require-ods-network or --pid-file yet")
         install = Path(args.install_dir or os.environ.get("ODS_HOME") or Path(__file__).resolve().parent.parent).resolve()
         try:
-            _serve_native_windows_agent(install, args.port)
+            _serve_native_windows_agent(install, args.port, parent_pipe=args.parent_pipe)
         except (ValueError, OSError) as error:
             logger.error("Native Windows startup failed: %s", error)
             sys.exit(1)
