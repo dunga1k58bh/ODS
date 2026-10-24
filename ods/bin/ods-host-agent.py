@@ -17549,6 +17549,21 @@ _WINDOWS_NATIVE_LLAMA_KEY_RE = re.compile(r"[0-9a-f]{64}")
 _WINDOWS_NATIVE_RESTART_TIMEOUT_SECONDS = 1200
 
 
+def _start_windows_native_runtime(host: Path, executable: Path,
+                                  arguments: list[str], log: Path):
+    """Experimental process bridge; model selection/proof remain with callers.
+
+    Explicit invocation only: existing installed Windows restart behavior is
+    unchanged. Keep the returned controller to stop this particular session.
+    """
+    if platform.system() != "Windows":
+        raise RuntimeError("The native Windows process host requires Windows")
+    from native_windows_runtime import NativeWindowsRuntime
+    runtime = NativeWindowsRuntime(host, executable, arguments, log)
+    atexit.register(runtime.stop)
+    return runtime
+
+
 def _restart_windows_native_llama_server(env_path: Path, env: dict):
     r"""Relaunch the installation's native Windows llama-server from its .env.
 

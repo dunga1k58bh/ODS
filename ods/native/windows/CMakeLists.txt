@@ -35,6 +35,9 @@ if(ODS_NATIVE_BUILD_TESTS)
     add_test(NAME native-regressions COMMAND ods-native-regressions
         "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/probe_utf8.py")
     set_tests_properties(native-regressions PROPERTIES TIMEOUT 20)
+    add_test(NAME native-stop-event COMMAND "${Python3_EXECUTABLE}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/stop_event.py" "$<TARGET_FILE:ods-native>")
+    set_tests_properties(native-stop-event PROPERTIES TIMEOUT 30)
     if(MSVC)
         target_compile_options(ods-native-regressions PRIVATE /WX)
     endif()

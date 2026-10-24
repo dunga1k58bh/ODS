@@ -17,15 +17,26 @@ int wmain(int argc, wchar_t* argv[])
     constexpr std::wstring_view kExpectModelPrefix = L"--expect-model=";
     constexpr std::wstring_view kPythonPrefix = L"--python=";
     constexpr std::wstring_view kOdsRootPrefix = L"--ods-root=";
+    constexpr std::wstring_view kStopEventPrefix = L"--stop-event=";
     constexpr unsigned int kMaxPort = 65535;
     std::filesystem::path child_log;
     std::filesystem::path expected_model;
     std::filesystem::path python;
     std::filesystem::path ods_root;
+    std::wstring stop_event_name;
     std::uint16_t readiness_port = 0;
     int command_index = 1;
     while (command_index < argc) {
         const std::wstring_view value{argv[command_index]};
+        if (value.starts_with(kStopEventPrefix)) {
+            if (value.size() == kStopEventPrefix.size()) {
+                std::cerr << "Expected --stop-event=<existing event name> before the command.\n";
+                return 1;
+            }
+            stop_event_name = value.substr(kStopEventPrefix.size());
+            ++command_index;
+            continue;
+        }
         if (value.starts_with(kPythonPrefix) || value.starts_with(kOdsRootPrefix)) {
             const bool is_python = value.starts_with(kPythonPrefix);
             const auto prefix = is_python ? kPythonPrefix : kOdsRootPrefix;
@@ -98,6 +109,10 @@ int wmain(int argc, wchar_t* argv[])
         std::cerr << "Place --v=<0..9> before the command or --help.\n";
         return 1;
     }
+    if (command_line.HasSwitch(L"stop-event") && stop_event_name.empty()) {
+        std::cerr << "Place --stop-event=<name> before the command.\n";
+        return 1;
+    }
     if (command_line.HasSwitch(L"child-log") && child_log.empty()) {
         std::cerr << "Place --child-log=<path> before the command or --help.\n";
         return 1;
@@ -122,22 +137,26 @@ int wmain(int argc, wchar_t* argv[])
                               (command_line.HasSwitch(L"wait-ready") ? 1 : 0) -
                               (command_line.HasSwitch(L"expect-model") ? 1 : 0) -
                               (command_line.HasSwitch(L"python") ? 1 : 0) -
-                              (command_line.HasSwitch(L"ods-root") ? 1 : 0);
+                              (command_line.HasSwitch(L"ods-root") ? 1 : 0) -
+                              (command_line.HasSwitch(L"stop-event") ? 1 : 0);
     if (!run_command && arguments.empty() &&
         (option_count == 0 || (option_count == 1 && command_line.HasSwitch(L"help") &&
                                command_line.GetSwitchValueNative(L"help").empty()))) {
-        std::cout << "ODS native Windows\n"
-                     "Usage: ods-native --help\n"
-                     "       ods-native [--v=<0..9>] [--child-log=<path>]\n"
-                     "                  [--wait-ready=<port>] [--expect-model=<path>]\n"
-                     "                  [--python=<exe>] [--ods-root=<ods directory>]\n"
-                     "                  run [--] <executable> [arguments...]\n\n"
-                     "Readiness runs ODS's existing Python model/completion proof (120-second "
-                     "deadline).\n"
-                     "Child log mode appends stdout/stderr to the file; stdin is NUL.\n"
-                     "Run waits for the executable and returns its exit code.\n"
-                     "Ctrl+C/Ctrl+Break allow up to 5 seconds for child shutdown,\n"
-                     "then forcibly stop the remaining process tree.\n";
+        std::cout
+            << "ODS native Windows\n"
+               "Usage: ods-native --help\n"
+               "       ods-native [--v=<0..9>] [--child-log=<path>]\n"
+               "                  [--wait-ready=<port>] [--expect-model=<path>]\n"
+               "                  [--python=<exe>] [--ods-root=<ods directory>]\n"
+               "                  [--stop-event=<name>]\n"
+               "                  run [--] <executable> [arguments...]\n\n"
+               "Readiness runs ODS's existing Python model/completion proof (120-second "
+               "deadline).\n"
+               "Child log mode appends stdout/stderr to the file; stdin is NUL.\n"
+               "Named stop requests require a controller-created event and a private console.\n"
+               "Run waits for the executable and returns its exit code.\n"
+               "Ctrl+C/Ctrl+Break allow up to 5 seconds for child shutdown,\n"
+               "then forcibly stop the remaining process tree.\n";
         return 0;
     }
 
@@ -147,7 +166,7 @@ int wmain(int argc, wchar_t* argv[])
                                      : next_index;
     if (run_command && argc > executable_index) {
         try {
-            const ConsoleControl console_control;
+            ConsoleControl console_control{stop_event_name};
             std::optional<PythonRuntimeProbe> probe;
             if (readiness_port != 0) {
                 probe.emplace(python, ods_root / L"native/windows/runtime_probe.py", readiness_port,
@@ -156,6 +175,7 @@ int wmain(int argc, wchar_t* argv[])
             const std::vector<std::wstring> child_arguments{argv + executable_index + 1,
                                                             argv + argc};
             auto process = ChildProcess::Start(argv[executable_index], child_arguments, child_log);
+            console_control.StartStopListener();
             if (probe) {
                 const auto result = probe->WaitUntilReady(process, console_control.GetStopEvent());
                 switch (result) {
