@@ -6,6 +6,7 @@ import PanelResizeHandle from './components/PanelResizeHandle'
 import MetalMetricIcon from './components/MetalMetricIcon'
 import InstallPromptBanner from './components/InstallPromptBanner'
 import PortalUpdateNotice from './components/PortalUpdateNotice'
+import NativeHostStatus from './components/NativeHostStatus'
 import { useSystemStatus } from './hooks/useSystemStatus'
 import { useVersion } from './hooks/useVersion'
 import { useFirstRun } from './hooks/useFirstRun'
@@ -128,6 +129,7 @@ function App() {
 
       <main className="pixel-workspace dashboard-market-shell portal-workspace flex-1 transition-all duration-200">
         <div className="portal-chat">
+          <NativeHostStatus />
           {showUpdate && <PortalUpdateNotice version={version} onDismiss={dismissUpdate} onReview={() => navigate('/settings?section=updates')} />}
           {status?.bootstrap?.active && <BootstrapBanner bootstrap={status.bootstrap} />}
           <Suspense fallback={<p className="p-6 text-theme-text-muted">Opening Portal…</p>}><Pixel systemStatus={status} /></Suspense>

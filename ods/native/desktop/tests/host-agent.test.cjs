@@ -22,14 +22,17 @@ test('owns a real native agent, waits for its PID and shuts it down through EOF'
   await new Promise(resolve => server.close(resolve))
   const config = { python, sourceRoot: path.resolve(__dirname, '../../..'), installDir: directory, port }
   const agent = new HostAgent(config, path.join(directory, 'agent.log'))
+  assert.deepEqual(agent.getStatus(), { state: 'starting' })
   try {
     const health = await agent.waitReady()
     assert.equal(health.pid, agent.child.pid)
     assert.equal(health.mode, 'native-windows')
+    assert.deepEqual(agent.getStatus(), { state: 'ready' })
   } finally {
     await agent.stop()
   }
   assert.equal(agent.child.exitCode, 0)
+  assert.deepEqual(agent.getStatus(), { state: 'stopped' })
   await agent.stop()
 
   await new Promise(resolve => server.listen(port, '127.0.0.1', resolve))
@@ -40,5 +43,14 @@ test('owns a real native agent, waits for its PID and shuts it down through EOF'
   } finally {
     await rejected.stop()
     await new Promise(resolve => server.close(resolve))
+  }
+  const crashed = new HostAgent(config, path.join(directory, 'agent.log'))
+  try {
+    await crashed.waitReady()
+    crashed.child.kill()
+    await crashed.closed
+    assert.deepEqual(crashed.getStatus(), { state: 'error' })
+  } finally {
+    await crashed.stop()
   }
 })

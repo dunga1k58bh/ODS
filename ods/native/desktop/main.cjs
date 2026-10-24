@@ -13,6 +13,24 @@ const csp = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inl
 let window
 let hostAgent
 let shutdownComplete = false
+let hostStartupFailed = false
+
+async function startNativeHost(configArgument) {
+  try {
+    const config = JSON.parse(fs.readFileSync(configArgument.slice('--native-config='.length), 'utf8'))
+    hostAgent = new HostAgent(config, path.join(app.getPath('logs'), 'native-host-agent.log'))
+    const health = await hostAgent.waitReady()
+    console.info(`Native host agent ready (PID ${health.pid})`)
+  } catch (error) {
+    if (hostAgent?.stopping) return
+    hostStartupFailed = true
+    console.error('Native host agent startup failed:', error.message)
+    if (hostAgent) {
+      try { await hostAgent.stop() }
+      catch (stopError) { console.error('Native host agent cleanup failed:', stopError.message) }
+    }
+  }
+}
 
 function createWindow() {
   window = new BrowserWindow({
@@ -44,12 +62,6 @@ if (!app.requestSingleInstanceLock()) {
     const root = path.join(app.getAppPath(), 'dist', 'renderer')
     if (!fs.existsSync(path.join(root, 'index.html'))) throw new Error('Dashboard build missing. Run npm run build first.')
     const configArgument = process.argv.find(argument => argument.startsWith('--native-config='))
-    if (configArgument) {
-      const config = JSON.parse(fs.readFileSync(configArgument.slice('--native-config='.length), 'utf8'))
-      hostAgent = new HostAgent(config, path.join(app.getPath('logs'), 'native-host-agent.log'))
-      const health = await hostAgent.waitReady()
-      console.info(`Native host agent ready (PID ${health.pid})`)
-    }
     session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
     session.defaultSession.setPermissionCheckHandler(() => false)
     // Until backend wiring exists, the shell serves only its bundled UI.
@@ -60,6 +72,13 @@ if (!app.requestSingleInstanceLock()) {
     protocol.handle('ods', async request => {
       const url = new URL(request.url)
       if (url.host !== 'app' || url.username || url.password) return new Response(null, { status: 403 })
+      if (url.pathname === '/api/desktop/host-status') {
+        if (request.method !== 'GET') return new Response(null, { status: 405 })
+        const status = hostStartupFailed ? { state: 'error' } : hostAgent?.getStatus() || { state: 'not-configured' }
+        return new Response(JSON.stringify(status), {
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+        })
+      }
       if (url.pathname === '/api' || url.pathname.startsWith('/api/')) {
         return new Response(JSON.stringify({ detail: 'Native desktop backend is not connected yet' }), {
           status: 503, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
@@ -75,7 +94,9 @@ if (!app.requestSingleInstanceLock()) {
         status: response.status, headers,
       })
     })
-    await createWindow()
+    const windowReady = createWindow()
+    if (configArgument) startNativeHost(configArgument)
+    await windowReady
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow().catch(error => dialog.showErrorBox('ODS', error.message))
     })

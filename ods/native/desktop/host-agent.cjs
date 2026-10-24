@@ -49,6 +49,7 @@ class HostAgent {
         if (health.mode !== 'native-windows' || health.pid !== this.child.pid) {
           throw new Error('Agent port belongs to a different process; no existing process was adopted')
         }
+        this.ready = true
         return health
       }
       await delay(100)
@@ -59,6 +60,14 @@ class HostAgent {
   stop() {
     if (!this.stopping) this.stopping = this.stopOwnedProcess()
     return this.stopping
+  }
+
+  getStatus() {
+    const exited = this.child.exitCode !== null || this.child.signalCode !== null
+    if (this.spawnError) return { state: 'error' }
+    if (this.stopping) return { state: exited ? 'stopped' : 'stopping' }
+    if (exited) return { state: 'error' }
+    return { state: this.ready ? 'ready' : 'starting' }
   }
 
   async stopOwnedProcess() {
