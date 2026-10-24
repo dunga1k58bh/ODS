@@ -46,6 +46,7 @@ Run ODS core functionality directly on Windows without Docker or WSL. Use C++ fo
 
 ## 4. Desktop and distribution
 
+- Desktop shell lives in `ods/native/desktop/` and uses Electron with the existing React dashboard. Run `npm ci` in the dashboard and desktop directories, then `npm run package:win` in the desktop directory. The result is `ods/native/windows/build/electron/ODS-win32-x64/ODS.exe` plus its runtime files; keep the whole folder. The bundled UI loads at `ods://app/`, without a frontend server on port 3001. Backend requests currently return 503 until Python wiring is implemented.
 - Add a desktop shell, tray behavior, optional sign-in startup, and visible error recovery.
 - Bundle runtime dependencies; separate binaries, private state, models, and logs.
 - Implement installation, verified updates, rollback, and uninstall with explicit data-retention choices.

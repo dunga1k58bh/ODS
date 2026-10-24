@@ -1,0 +1,19 @@
+{
+  "name": "ods-desktop",
+  "productName": "ODS",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron shell for the existing ODS React dashboard",
+  "license": "Apache-2.0",
+  "main": "main.cjs",
+  "scripts": {
+    "build": "node scripts/build-ui.cjs",
+    "start": "install-electron && electron .",
+    "test": "node --test tests/*.test.cjs",
+    "package:win": "npm run build && electron-packager . ODS --platform=win32 --arch=x64 --out=../windows/build/electron --overwrite --asar --ignore=^/scripts --ignore=^/tests"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "45.0.0"
+  }
+}
