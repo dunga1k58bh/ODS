@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -67,6 +67,37 @@ class NativeProbeTests(unittest.TestCase):
 
 
 class NativeLaunchArgumentsTests(unittest.TestCase):
+    def test_opt_in_routes_restart_and_retains_restored_session(self):
+        agent = bridge.load_host_agent()
+        env = dict(ODS_NATIVE_HOST_EXE="C:/ods/ods-native.exe",
+                   ODS_NATIVE_LLAMA_EXE="C:/ods/llama-server.exe",
+                   ODS_NATIVE_API_KEY_FILE="C:/private/key", GPU_BACKEND="nvidia",
+                   GGUF_FILE="Qwen.gguf", CTX_SIZE="4096", N_GPU_LAYERS="99",
+                   AMD_INFERENCE_LOCATION="host", AMD_INFERENCE_RUNTIME="llama-server")
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            with patch.object(agent.platform, "system", return_value="Windows"), \
+                    patch.object(agent, "_active_model_directory", return_value=Path(directory)), \
+                    patch.object(agent._model_stores, "registered_runtime_profile", return_value=None), \
+                    patch.object(agent.socket, "socket"), \
+                    patch.object(agent, "_start_windows_native_llama") as start, \
+                    patch.object(agent, "_restart_windows_native_llama") as restart, \
+                    patch.object(agent.subprocess, "run") as shell:
+                self.assertTrue(agent._is_windows_host_llama_server(env))
+                agent._restart_windows_native_llama_server(env_path, env)
+                first = start.return_value
+                agent._restart_windows_native_llama_server(env_path, env | {"CTX_SIZE": "8192"})
+                self.assertIs(restart.call_args.args[0], first)
+                self.assertEqual(restart.call_args.kwargs["context_length"], 8192)
+                restored = Mock()
+                restart.side_effect = agent.NativeLlamaRestartError("restored", restored)
+                with self.assertRaises(agent.NativeLlamaRestartError):
+                    agent._restart_windows_native_llama_server(env_path, env)
+                self.assertIs(agent._WINDOWS_NATIVE_SESSIONS[env_path.parent.resolve()], restored)
+                shell.assert_not_called()
+                with self.assertRaises(ValueError):
+                    agent._restart_windows_native_llama_server(env_path, env | {"LLAMA_ARG_FLASH_ATTN": "on"})
+
     @classmethod
     def setUpClass(cls):
         # The host agent adds its bin directory for shared Python imports.
@@ -142,6 +173,56 @@ class NativeLaunchArgumentsTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     agent._start_windows_native_llama(**options)
                 runtime.stop.assert_called_once()
+                # Restart validates first, then stops, starts and proves in order.
+                previous = Mock()
+                previous._llama_launch_settings = options.copy()
+                previous.poll.return_value = None
+                events = []
+                def stop_old():
+                    events.append("stop-old")
+                    previous.poll.return_value = 130
+                previous.stop.side_effect = stop_old
+                start.side_effect = lambda *args: (events.append("start-new") or runtime)
+                runtime.poll.return_value = None
+                wait.side_effect = lambda *args, **kwargs: (events.append("prove") or {"contextLength": 8192})
+                restarted = agent._restart_windows_native_llama(
+                    previous, **(options | {"context_length": 8192}))
+                self.assertIs(restarted, runtime)
+                self.assertEqual(events, ["stop-old", "start-new", "prove"])
+                self.assertEqual(start.call_args.args[2][
+                    start.call_args.args[2].index("--ctx-size") + 1], "8192")
+                previous.stop.reset_mock()
+                previous.poll.return_value = None
+                start.reset_mock()
+                with self.assertRaises(ValueError):
+                    agent._restart_windows_native_llama(previous, **(options | {"port": 0}))
+                previous.stop.assert_not_called()
+                start.assert_not_called()
+                previous.stop.side_effect = OSError("stop failed")
+                with self.assertRaises(OSError):
+                    agent._restart_windows_native_llama(previous, **options)
+                start.assert_not_called()
+                previous.stop.side_effect = None
+                previous.poll.return_value = None
+                with self.assertRaises(RuntimeError):
+                    agent._restart_windows_native_llama(previous, **options)
+                start.assert_not_called()
+                previous.stop.side_effect = stop_old
+                wait.side_effect = None
+                wait.return_value = {}
+                runtime.stop.reset_mock()
+                with self.assertRaises(RuntimeError):
+                    agent._restart_windows_native_llama(previous, **options)
+                self.assertEqual(runtime.stop.call_count, 2)
+                wait.side_effect = [{}, {"contextLength": 4096}]
+                runtime.stop.reset_mock()
+                with self.assertRaises(agent.NativeLlamaRestartError) as failure:
+                    agent._restart_windows_native_llama(previous, **(options | {"context_length": 8192}))
+                self.assertIs(failure.exception.restored_runtime, runtime)
+                runtime.stop.assert_called_once()
+                self.assertEqual(start.call_args.args[2][
+                    start.call_args.args[2].index("--ctx-size") + 1], "4096")
+                start.side_effect = None
                 for change in ({"api_key": "invalid"}, {"api_key": "cd" * 32},
                                {"host": root / "missing.exe"}, {"log": key}):
                     start.reset_mock()

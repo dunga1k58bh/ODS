@@ -35,6 +35,7 @@ Run ODS core functionality directly on Windows without Docker or WSL. Use C++ fo
 - Add a native Windows adapter to the existing Model Switchboard.
 - Retain model selection, activation transactions, routing, and rollback in the existing control layer.
 - Run the required backend services natively and connect the dashboard.
+- Once model switching through the UI is ready and verified, remind the user to remove the temporary `smoke.ps1` and `smoke.py` scripts. Keep the automated regression tests.
 - Port Portal/Pixel lifecycle, IPC, and permissions; establish Windows execution isolation before enabling agent tools.
 
 **Exit:** onboarding, model download/switching, streaming chat, and unload/resume work end to end.

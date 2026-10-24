@@ -17529,7 +17529,7 @@ def _is_windows_host_llama_server(env: dict) -> bool:
     managed = env.get("AMD_INFERENCE_MANAGED", "true").lower()
     return (
         platform.system().lower() == "windows"
-        and env.get("GPU_BACKEND", "").lower() == "amd"
+        and (env.get("GPU_BACKEND", "").lower() == "amd" or bool(env.get("ODS_NATIVE_HOST_EXE")))
         and location == "host"
         and managed != "false"
         and (
@@ -17547,6 +17547,8 @@ _WINDOWS_NATIVE_LLAMA_KEY_RE = re.compile(r"[0-9a-f]{64}")
 # native-llm-restart resolves the model, stops the previous server and then
 # waits up to 900 s (ODSNativeLlamaStartupSeconds) for the proof.
 _WINDOWS_NATIVE_RESTART_TIMEOUT_SECONDS = 1200
+_WINDOWS_NATIVE_SESSIONS = {}
+_WINDOWS_NATIVE_SESSION_LOCK = threading.RLock()
 
 
 def _start_windows_native_runtime(host: Path, executable: Path,
@@ -17567,7 +17569,7 @@ def _start_windows_native_runtime(host: Path, executable: Path,
 def _start_windows_native_llama(*, host: Path, executable: Path, model: Path,
                                 api_key_file: Path, api_key: str, log: Path,
                                 port: int, context_length: int, gpu_layers: int,
-                                backend: str):
+                                backend: str, previous_runtime=None):
     """Explicit basic CPU/CUDA launch, separate from installed restart policy.
 
     The caller supplies the selected runtime and an already provisioned private
@@ -17590,6 +17592,12 @@ def _start_windows_native_llama(*, host: Path, executable: Path, model: Path,
         raise ValueError("The native runtime key file does not match the configured key")
     if log.resolve() in {path.resolve() for path in (host, executable, model, api_key_file)}:
         raise ValueError("The runtime log must not overwrite a runtime, model or key file")
+    # Complete validation before touching the session being replaced. Stop only
+    # the controller the caller owns; never discover a process by name or port.
+    if previous_runtime is not None:
+        previous_runtime.stop()
+        if previous_runtime.poll() is None:
+            raise RuntimeError("The previous native runtime has not stopped; restart aborted")
     runtime = _start_windows_native_runtime(host, executable, arguments, log)
     ready = False
     try:
@@ -17608,12 +17616,95 @@ def _start_windows_native_llama(*, host: Path, executable: Path, model: Path,
         )
         if not proof or runtime.poll() is not None:
             raise RuntimeError("Native llama-server exited or failed model/context readiness")
+        runtime._llama_launch_settings = dict(
+            host=host, executable=executable, model=model, api_key_file=api_key_file,
+            api_key=api_key, log=log, port=port, context_length=context_length,
+            gpu_layers=gpu_layers, backend=backend,
+        )
         ready = True
         return runtime
     finally:
         # Also clean up on exceptions and keyboard interruption during proof.
         if not ready:
             runtime.stop()
+
+
+class NativeLlamaRestartError(RuntimeError):
+    def __init__(self, message, restored_runtime=None):
+        super().__init__(message)
+        self.restored_runtime = restored_runtime
+
+
+def _restart_windows_native_llama(runtime, **settings):
+    """Replace an owned session, restoring its last proven settings on failure.
+
+    Callers must serialize lifecycle requests and replace their runtime reference
+    with the returned session, or the error's restored_runtime after recovery.
+    Keep the old key file available and unchanged until restart finishes.
+    """
+    previous_settings = dict(runtime._llama_launch_settings)
+    try:
+        return _start_windows_native_llama(previous_runtime=runtime, **settings)
+    except Exception as restart_error:
+        if runtime.poll() is None:
+            # Validation/stop failed while the original session is still alive.
+            raise
+        try:
+            restored = _start_windows_native_llama(**previous_settings)
+        except Exception as restore_error:
+            raise NativeLlamaRestartError(
+                "Native restart failed and the previous configuration could not be restored"
+            ) from restore_error
+        raise NativeLlamaRestartError(
+            "Native restart failed; the previous configuration was restored", restored
+        ) from restart_error
+
+
+def _restart_experimental_windows_native(env_path: Path, env: dict):
+    """Opt-in basic text runtime; serialize ownership within this host agent."""
+    if platform.system() != "Windows":
+        raise RuntimeError("The experimental native runtime requires Windows")
+    backend = {"nvidia": "cuda", "cpu": "cpu"}.get(env.get("GPU_BACKEND"))
+    if backend is None:
+        raise ValueError("The experimental native runtime supports CPU/NVIDIA only")
+    if any(value for key, value in env.items() if key.startswith("LLAMA_ARG_")):
+        raise ValueError("The experimental native runtime does not support LLAMA_ARG tuning yet")
+    if env.get("LLAMA_REASONING", "off") != "off":
+        raise ValueError("The experimental native runtime supports reasoning off only")
+    model_name = env.get("GGUF_FILE", "")
+    if not model_name or Path(model_name).name != model_name:
+        raise ValueError("GGUF_FILE must name one model file")
+    if _model_stores.registered_runtime_profile(INSTALL_DIR / "data", model_name):
+        raise ValueError("Registered runtime profiles are not supported by the experimental launcher yet")
+    settings = dict(
+        host=Path(env["ODS_NATIVE_HOST_EXE"]),
+        executable=Path(env.get("ODS_NATIVE_LLAMA_EXE", "")),
+        model=_active_model_directory(env) / model_name,
+        api_key_file=Path(env.get("ODS_NATIVE_API_KEY_FILE", "")),
+        api_key=env.get("LLAMA_SERVER_API_KEY", ""),
+        log=env_path.parent / "data" / "native-llama.log",
+        port=int(env.get("AMD_INFERENCE_PORT") or env.get("OLLAMA_PORT") or "8080"),
+        context_length=int(env.get("CTX_SIZE") or "4096"),
+        gpu_layers=int(env.get("N_GPU_LAYERS") or "0"), backend=backend,
+    )
+    installation = env_path.parent.resolve()
+    with _WINDOWS_NATIVE_SESSION_LOCK:
+        previous = _WINDOWS_NATIVE_SESSIONS.get(installation)
+        if previous is None:
+            # Never adopt or stop an existing task/foreign listener. This mode
+            # starts only after the old runtime has been stopped separately.
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", settings["port"]))
+            _WINDOWS_NATIVE_SESSIONS[installation] = _start_windows_native_llama(**settings)
+        else:
+            try:
+                _WINDOWS_NATIVE_SESSIONS[installation] = _restart_windows_native_llama(previous, **settings)
+            except NativeLlamaRestartError as error:
+                if error.restored_runtime is not None:
+                    _WINDOWS_NATIVE_SESSIONS[installation] = error.restored_runtime
+                else:
+                    del _WINDOWS_NATIVE_SESSIONS[installation]
+                raise
 
 
 def _restart_windows_native_llama_server(env_path: Path, env: dict):
@@ -17628,6 +17719,8 @@ def _restart_windows_native_llama_server(env_path: Path, env: dict):
     starts, stops or kills the process and never writes the key file; it
     proves the result again through ``_wait_for_model_readiness``.
     """
+    if env.get("ODS_NATIVE_HOST_EXE"):
+        return _restart_experimental_windows_native(env_path, env)
     install_dir = env_path.parent
     cli = install_dir / "ods.ps1"
     if not cli.is_file():

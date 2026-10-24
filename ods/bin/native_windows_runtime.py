@@ -33,7 +33,8 @@ def build_llama_arguments(*, model: Path, api_key_file: Path, port: int,
         "--host", "127.0.0.1", "--port", str(port),
         "--ctx-size", str(context_length), "--parallel", "1",
         "--n-gpu-layers", str(gpu_layers if backend == "cuda" else 0),
-        "--metrics", "--no-webui", "--api-key-file", str(api_key_file),
+        "--metrics", "--no-webui", "--reasoning", "off",
+        "--api-key-file", str(api_key_file),
     ]
     if backend == "cuda":
         # Match the existing Windows runtime: retain the planned GPU settings.
